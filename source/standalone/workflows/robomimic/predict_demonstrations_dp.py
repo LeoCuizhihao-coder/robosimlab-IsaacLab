@@ -16,8 +16,10 @@ from omni.isaac.lab.app import AppLauncher
 parser = argparse.ArgumentParser(description="Collect demonstrations for Isaac Lab environments.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default="Isaac-Lift-Cube-Franka-IK-Abs-dp", help="Name of the task.")
-parser.add_argument("--ckpt_path", type=str, default=r"D:\git_project\IsaacLab\logs\robomimic\Isaac-Lift-Cube-Franka-IK-Rel-dp_exp2\latest.ckpt", help="Name of the task.")
+parser.add_argument("--ckpt_path", type=str, default=r"D:\git_project\IsaacLab\logs\robomimic\Isaac-Lift-Cube-Franka-IK-Rel-dp_20240907_6d_frame2\latest_50.ckpt", help="Name of the task.")
+parser.add_argument("--replicator", type=bool, default=False, help="enable table replicator")
 parser.add_argument("--teleop_device", type=str, default="keyboard", help="Device for interacting with environment")
+parser.add_argument("--out_dim", type=int, default=6, help="low-dim or high dim task")
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -31,19 +33,17 @@ simulation_app = app_launcher.app
 
 import contextlib
 import gymnasium as gym
-import os
 import torch
 import hydra
 import dill
 
 from omni.isaac.lab.devices import Se3Keyboard, Se3SpaceMouse
 from omni.isaac.lab.managers import TerminationTermCfg as DoneTerm
-from omni.isaac.lab.utils.io import dump_pickle, dump_yaml
 
 import omni.isaac.lab_tasks  # noqa: F401
 from omni.isaac.lab_tasks.manager_based.manipulation.lift import mdp
 from omni.isaac.lab_tasks.utils.parse_cfg import parse_env_cfg
-from omni.isaac.lab.utils.math import project_points, matrix_from_quat
+from omni.isaac.lab.utils.math import project_points, euler_xyz_from_quat, matrix_from_quat
 
 import omni.replicator.core as rep
 
@@ -80,6 +80,17 @@ def get_object_pose_in_camera_frame(R_cam_inv, t_cam_inv, R_obj, t_obj):
     t_obj_to_cam = torch.matmul(R_cam_inv, t_obj) + t_cam_inv
 
     return R_obj_to_cam, t_obj_to_cam
+
+
+def convert_quat_to_euler(poses):
+    roll, pitch, yaw = euler_xyz_from_quat(poses[:, 3:])
+    # quat to euler in xyz-format degree unit
+    euler_rad = torch.concat([roll.unsqueeze(1), pitch.unsqueeze(1), yaw.unsqueeze(1)],
+                             dim=-1)  # [Action, 3]
+    euler_deg = torch.rad2deg(euler_rad)  # [Action, 3]
+    poses = torch.concat([poses[:, :3], euler_deg], dim=-1)  # [Action, 6]
+    return poses
+
 
 def load_dp(ckpt_path):
     # load checkpoint
@@ -213,32 +224,33 @@ def main():
     print("[Info] tv_camera_extrinsic ", tv_camera_extrinsic)
 
     ############################ replicator #############################
-    # get background info
-    # table_name = "table"
-    # table = env.scene[table_name]
-    # table_path = table.prim_paths[0]
-    # table_prim = rep.get.prims(path_pattern=table_path)
-    # def base_table_random():
-    #     with table_prim:
-    #         rep.randomizer.color(colors=rep.distribution.uniform((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)))
-    #     return table_prim.node
-    # rep.randomizer.register(base_table_random, override=True)
-    # with rep.trigger.on_custom_event(event_name="Randomize!"):
-    #     rep.randomizer.base_table_random()
+    if args_cli.replicator:
+        # # get background info
+        table_name = "table"
+        table = env.scene[table_name]
+        table_path = table.prim_paths[0]
+        table_prim = rep.get.prims(path_pattern=table_path)
+        def base_table_random():
+            with table_prim:
+                rep.randomizer.color(colors=rep.distribution.uniform((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)))
+            return table_prim.node
+        rep.randomizer.register(base_table_random, override=True)
+        with rep.trigger.on_custom_event(event_name="Randomize!"):
+            rep.randomizer.base_table_random()
 
-    # # get plane info
-    # plane_name = "plane"
-    # plane = env.scene[plane_name]
-    # plane_path = plane.prim_paths[0]
-    # def base_plane_colors():
-    #     plane_prim = rep.get.prims(path_pattern=plane_path)
-    #     with plane_prim:
-    #         rep.randomizer.color(colors=rep.distribution.uniform((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)))
-    #     return plane_prim.node
-    # rep.randomizer.register(base_plane_colors, override=True)
-    # # with rep.trigger.on_frame():
-    # with rep.trigger.on_custom_event(event_name="Randomize!"):
-    #     rep.randomizer.base_plane_colors()
+        # # get plane info
+        # plane_name = "plane"
+        # plane = env.scene[plane_name]
+        # plane_path = plane.prim_paths[0]
+        # def base_plane_colors():
+        #     plane_prim = rep.get.prims(path_pattern=plane_path)
+        #     with plane_prim:
+        #         rep.randomizer.color(colors=rep.distribution.uniform((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)))
+        #     return plane_prim.node
+        # rep.randomizer.register(base_plane_colors, override=True)
+        # # with rep.trigger.on_frame():
+        # with rep.trigger.on_custom_event(event_name="Randomize!"):
+        #     rep.randomizer.base_plane_colors()
     #######################################################################
 
     ############################ load dp policy #############################
@@ -284,7 +296,7 @@ def main():
 
             # predict every two frames [(1, H, W, 3) ... (1, H, W, 3)]
             if len(tv_images_list) == 2:
-                camera_1 = torch.concat(eih_images_list, dim=0) # [2, H, W, C]
+                camera_1 = torch.concat(eih_images_list, dim=0) # [frame=2, H, W, C]
                 camera_1 = camera_1.permute(0, 3, 1, 2).contiguous() # [2, C, H, W]
                 camera_1 = camera_1.unsqueeze(0) # [1, 2, C, H, W]
                 # print("camera_1 ", camera_1.shape)
@@ -295,7 +307,15 @@ def main():
                 # print("camera_3 ", camera_3.shape)
 
                 robot_eef_pose = torch.concat(robot_eef_pose_list, dim=0) # [2, 7]
-                robot_eef_pose = robot_eef_pose[:, :2].unsqueeze(0) # [1, 2, 2]
+                robot_eef_pose = convert_quat_to_euler(robot_eef_pose) # [2, 6] quat to euler
+
+                # for XY (low-dim) prediction
+                if args_cli.out_dim == 2:
+                    robot_eef_pose = robot_eef_pose[:, :2].unsqueeze(0) # [1, 2, 2]
+                # for XYZRPY (high-dim) prediction
+                if args_cli.out_dim == 6:
+                    robot_eef_pose = robot_eef_pose.unsqueeze(0)  # [1, 2, 6]
+
                 # print("robot_eef_pose ", robot_eef_pose.shape)
 
                 obs = {
@@ -311,8 +331,10 @@ def main():
                 actions = result['action']  # [1, N=15, XY-Plane=2] N frames
                 # take first frame
                 xy_action = actions[:, 0, :]  # take first frame
-                act_dim = xy_action.shape[-1] # xy-plane is 2
-                actions = torch.concat([xy_action, init_actions[:, act_dim:]], dim=-1)  # [1, 8] xyz,wxyz,gripper
+
+                # 因为DP源代码没有XYZ的config, 因此这里手动取前3个action
+                act_dim = 3 # 2 or 3 or 6
+                actions = torch.concat([xy_action[:, :act_dim], init_actions[:, act_dim:]], dim=-1)  # [1, 8] xyz,wxyz,gripper
                 # print("actions ", actions.shape)
 
                 # perform action on environment

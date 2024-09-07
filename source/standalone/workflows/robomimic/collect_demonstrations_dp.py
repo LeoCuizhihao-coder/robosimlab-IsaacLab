@@ -14,12 +14,15 @@ from omni.isaac.lab.app import AppLauncher
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Collect demonstrations for Isaac Lab environments.")
-parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
-parser.add_argument("--task", type=str, default=None, help="Name of the task.")
+parser.add_argument("--task", type=str, default="Isaac-Lift-Cube-Franka-IK-Rel-dp", help="Name of the task.")
 parser.add_argument("--teleop_device", type=str, default="keyboard", help="Device for interacting with environment")
 parser.add_argument("--num_demos", type=int, default=1, help="Number of episodes to store in the dataset.")
 parser.add_argument("--fps", type=int, default=30, help="diffusion video fps.")
+parser.add_argument("--skip_frame", type=int, default=2, help="save every N frame")
+parser.add_argument("--replicator", type=bool, default=False, help="enable table replicator")
+parser.add_argument("--gripper", type=bool, default=True, help="collect gripper status, open 1, close -1")
 parser.add_argument("--debug", type=bool, default=False, help="draw ee pose and action on video.")
+parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -83,14 +86,13 @@ def get_object_pose_in_camera_frame(R_cam_inv, t_cam_inv, R_obj, t_obj):
     return R_obj_to_cam, t_obj_to_cam
 
 
-def convert_quat_to_euler(poses):
-    roll, pitch, yaw = euler_xyz_from_quat(poses[:, 3:])
+def convert_quat_to_euler(quat):
+    roll, pitch, yaw = euler_xyz_from_quat(quat)
     # quat to euler in xyz-format degree unit
     euler_rad = torch.concat([roll.unsqueeze(1), pitch.unsqueeze(1), yaw.unsqueeze(1)],
                              dim=-1)  # [Action, 3]
     euler_deg = torch.rad2deg(euler_rad)  # [Action, 3]
-    poses = torch.concat([poses[:, :3], euler_deg], dim=-1)  # [Action, 6]
-    return poses
+    return euler_deg
 
 
 def main():
@@ -198,32 +200,33 @@ def main():
     print("[Info] tv_camera_extrinsic ", tv_camera_extrinsic)
 
     ############################ replicator #############################
-    # # get background info
-    # table_name = "table"
-    # table = env.scene[table_name]
-    # table_path = table.prim_paths[0]
-    # table_prim = rep.get.prims(path_pattern=table_path)
-    # def base_table_random():
-    #     with table_prim:
-    #         rep.randomizer.color(colors=rep.distribution.uniform((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)))
-    #     return table_prim.node
-    # rep.randomizer.register(base_table_random, override=True)
-    # with rep.trigger.on_custom_event(event_name="Randomize!"):
-    #     rep.randomizer.base_table_random()
+    if args_cli.replicator:
+        # # get background info
+        table_name = "table"
+        table = env.scene[table_name]
+        table_path = table.prim_paths[0]
+        table_prim = rep.get.prims(path_pattern=table_path)
+        def base_table_random():
+            with table_prim:
+                rep.randomizer.color(colors=rep.distribution.uniform((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)))
+            return table_prim.node
+        rep.randomizer.register(base_table_random, override=True)
+        with rep.trigger.on_custom_event(event_name="Randomize!"):
+            rep.randomizer.base_table_random()
 
-    # # get plane info
-    # plane_name = "plane"
-    # plane = env.scene[plane_name]
-    # plane_path = plane.prim_paths[0]
-    # def base_plane_colors():
-    #     plane_prim = rep.get.prims(path_pattern=plane_path)
-    #     with plane_prim:
-    #         rep.randomizer.color(colors=rep.distribution.uniform((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)))
-    #     return plane_prim.node
-    # rep.randomizer.register(base_plane_colors, override=True)
-    # # with rep.trigger.on_frame():
-    # with rep.trigger.on_custom_event(event_name="Randomize!"):
-    #     rep.randomizer.base_plane_colors()
+        # # get plane info
+        # plane_name = "plane"
+        # plane = env.scene[plane_name]
+        # plane_path = plane.prim_paths[0]
+        # def base_plane_colors():
+        #     plane_prim = rep.get.prims(path_pattern=plane_path)
+        #     with plane_prim:
+        #         rep.randomizer.color(colors=rep.distribution.uniform((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)))
+        #     return plane_prim.node
+        # rep.randomizer.register(base_plane_colors, override=True)
+        # # with rep.trigger.on_frame():
+        # with rep.trigger.on_custom_event(event_name="Randomize!"):
+        #     rep.randomizer.base_plane_colors()
     #######################################################################
 
     # save mp4 video for diffusion policy training
@@ -232,6 +235,7 @@ def main():
     global tv_images_list
     global eih_images_list
     # global increase_robot_eef_position
+    frame_cnt = 0
     episode_cnt = 0
     is_success = False
     save_episode = False
@@ -249,29 +253,38 @@ def main():
             delta_pose = torch.tensor(delta_pose, dtype=torch.float, device=env.device).repeat(env.num_envs, 1)
             # compute actions based on environment
             actions = pre_process_actions(delta_pose, gripper_command)
-            # TODO: Deal with the case when reset is triggered by teleoperation device.
-            #   The observations need to be recollected.
-            # store signals before stepping
-            # -- obs
-            # -- camera image
-            tv_images_list.append(obs_dict["policy"][tv_cam_name])
-            eih_images_list.append(obs_dict["policy"][eih_cam_name])
 
-            # -- ee pose
-            robot_eef_pos = obs_dict["policy"]["robot_eef_pos"]
-            robot_eef_quat = obs_dict["policy"]["robot_eef_quat"]
-            robot_eef_position = torch.concat([robot_eef_pos, robot_eef_quat], dim=-1)  # [1, 7=xyz+quat]
-            robot_eef_pose_list.append(robot_eef_position)
+            if frame_cnt % args_cli.skip_frame == 0:
+                # The observations need to be recollected.
+                # store signals before stepping
+                # -- obs
+                # -- camera image
+                tv_images_list.append(obs_dict["policy"][tv_cam_name])
+                eih_images_list.append(obs_dict["policy"][eih_cam_name])
 
-            # -- actions (relative action)
-            abs_action_pos = robot_eef_pos + actions[:, :3]
-            abs_action_position = torch.concat([abs_action_pos, robot_eef_quat], dim=-1)  # [1, 7=xyz+quat]
-            action_list.append(abs_action_position)
-            # print("\n")
+                # -- ee pose
+                robot_eef_pos = obs_dict["policy"]["robot_eef_pos"]
+                robot_eef_quat = obs_dict["policy"]["robot_eef_quat"]
+                if args_cli.gripper:
+                    robot_eef_position = torch.concat([robot_eef_pos, robot_eef_quat, actions[:, -1:]], dim=-1)  # [1, 8=xyz+quat+gripper]
+                else:
+                    robot_eef_position = torch.concat([robot_eef_pos, robot_eef_quat], dim=-1)  # [1, 7=xyz+quat]
+                robot_eef_pose_list.append(robot_eef_position)
+
+                # -- actions (relative action)
+                abs_action_pos = robot_eef_pos + actions[:, :3]
+                if args_cli.gripper:
+                    abs_action_position = torch.concat([abs_action_pos, robot_eef_quat, actions[:, -1:]], dim=-1)  # [1, 8=xyz+quat+gripper]
+                else:
+                    abs_action_position = torch.concat([abs_action_pos, robot_eef_quat], dim=-1)  # [1, 7=xyz+quat]
+                action_list.append(abs_action_position)
+                # print("\n")
 
             # perform action on environment
             # print("actions ", actions)
             obs_dict, rewards, terminated, truncated, info = env.step(actions)
+            frame_cnt += 1
+
             # check that simulation is stopped or not
             if env.unwrapped.sim.is_stopped():
                 break
@@ -289,16 +302,31 @@ def main():
 
                 if is_success:
                     print("[Info] Action length ", len(action_list))
+                    # eep pose (euler format)
+                    robot_eef_poses = torch.concat(robot_eef_pose_list, dim=0) # [Action, 7 or 8]
+                    robot_eef_euler_deg = convert_quat_to_euler(robot_eef_poses[:, 3:7]) # [3]
+                    if args_cli.gripper:
+                        robot_eef_poses = torch.concat([robot_eef_poses[:, :3],
+                                                        robot_eef_euler_deg,
+                                                        robot_eef_poses[:, 7:8]], dim=-1)  # [Action=7]
+                    else:
+                        robot_eef_poses = torch.concat([robot_eef_poses[:, :3],
+                                                        robot_eef_euler_deg], dim=-1)  # [Action=6]
 
-                    robot_eef_poses = torch.concat(robot_eef_pose_list, dim=0) # [Action, 7]
-                    robot_eef_poses = convert_quat_to_euler(robot_eef_poses) # [Action, 6]
-
+                    # action (euler format)
                     action_poses = torch.concat(action_list, dim=0) # [Action, 7]
-                    action_poses = convert_quat_to_euler(action_poses) # [Action, 6]
+                    action_euler_deg = convert_quat_to_euler(action_poses[:, 3:7]) # [3]
+                    if args_cli.gripper:
+                        action_poses = torch.concat([action_poses[:, :3],
+                                                    action_euler_deg,
+                                                    action_poses[:, 7:8]], dim=-1)  # [Action=7]
+                    else:
+                        action_poses = torch.concat([action_poses[:, :3],
+                                                    action_euler_deg], dim=-1)  # [Action=6]
 
                     episode = {
-                        'action': action_poses.cpu().numpy(), # [Action, 6]
-                        'robot_eef_pose': robot_eef_poses.cpu().numpy()  # [Action, 6]
+                        'action': action_poses.cpu().numpy(), # [Action, 6 or 7]
+                        'robot_eef_pose': robot_eef_poses.cpu().numpy()  # [Action, 6 or 7]
                     }
                     replay_buffer.add_episode(episode)
                     episode_cnt += 1
@@ -317,7 +345,7 @@ def main():
 
                         if args_cli.debug:
                             # -- project ee frame pose to 2d image (for debug)
-                            ee_matrix_w = matrix_from_quat(eef_pose_w[:, 3:]).squeeze() # ee pose quat in world frame
+                            ee_matrix_w = matrix_from_quat(eef_pose_w[:, 3:7]).squeeze() # ee pose quat in world frame
                             ee_pos_w = eef_pose_w[:, :3].squeeze() # ee pose position in world frame
                             _, ee_pos_in_cam = get_object_pose_in_camera_frame(tv_cam_matrix_inv_w,
                                                                                tv_cam_pos_inv_w,
@@ -329,7 +357,7 @@ def main():
                             cv2.circle(image, (image_w - ee_pos[0], ee_pos[1]), 1, (0, 0, 255), -1)  # red, in BGR format
 
                             # -- project abs action pose to 2d image (for debug)
-                            action_matrix_w = matrix_from_quat(action_w[:, 3:]).squeeze()  # ee pose quat in world frame
+                            action_matrix_w = matrix_from_quat(action_w[:, 3:7]).squeeze()  # ee pose quat in world frame
                             action_pos_w = action_w[:, :3].squeeze()  # ee pose position in world frame
                             _, action_pos_in_cam = get_object_pose_in_camera_frame(tv_cam_matrix_inv_w,
                                                                                    tv_cam_pos_inv_w,
