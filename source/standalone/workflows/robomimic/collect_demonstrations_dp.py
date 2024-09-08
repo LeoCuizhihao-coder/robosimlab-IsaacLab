@@ -265,8 +265,10 @@ def main():
                 # -- ee pose
                 robot_eef_pos = obs_dict["policy"]["robot_eef_pos"]
                 robot_eef_quat = obs_dict["policy"]["robot_eef_quat"]
+                gripper_actions = obs_dict["policy"]["gripper_actions"]
+
                 if args_cli.gripper:
-                    robot_eef_position = torch.concat([robot_eef_pos, robot_eef_quat, actions[:, -1:]], dim=-1)  # [1, 8=xyz+quat+gripper]
+                    robot_eef_position = torch.concat([robot_eef_pos, robot_eef_quat, gripper_actions], dim=-1)  # [1, 8=xyz+quat+gripper]
                 else:
                     robot_eef_position = torch.concat([robot_eef_pos, robot_eef_quat], dim=-1)  # [1, 7=xyz+quat]
                 robot_eef_pose_list.append(robot_eef_position)
@@ -303,31 +305,31 @@ def main():
                 if is_success:
                     print("[Info] Action length ", len(action_list))
                     # eep pose (euler format)
-                    robot_eef_poses = torch.concat(robot_eef_pose_list, dim=0) # [Action, 7 or 8]
-                    robot_eef_euler_deg = convert_quat_to_euler(robot_eef_poses[:, 3:7]) # [3]
+                    __robot_eef_pose = torch.concat(robot_eef_pose_list, dim=0) # [Action, 7 or 8]
                     if args_cli.gripper:
-                        robot_eef_poses = torch.concat([robot_eef_poses[:, :3],
-                                                        robot_eef_euler_deg,
-                                                        robot_eef_poses[:, 7:8]], dim=-1)  # [Action=7]
-                    else:
-                        robot_eef_poses = torch.concat([robot_eef_poses[:, :3],
-                                                        robot_eef_euler_deg], dim=-1)  # [Action=6]
+                        __gripper_position = __robot_eef_pose[:, 7:8] # [Action=1]
+                    __robot_eef_euler_deg = convert_quat_to_euler(__robot_eef_pose[:, 3:7]) # [3]
+                    __robot_eef_pose = torch.concat([__robot_eef_pose[:, :3],
+                                                     __robot_eef_euler_deg], dim=-1)  # [Action=6]
 
                     # action (euler format)
-                    action_poses = torch.concat(action_list, dim=0) # [Action, 7]
-                    action_euler_deg = convert_quat_to_euler(action_poses[:, 3:7]) # [3]
+                    __action = torch.concat(action_list, dim=0) # [Action, 7]
+                    __action_euler_deg = convert_quat_to_euler(__action[:, 3:7]) # [3]
                     if args_cli.gripper:
-                        action_poses = torch.concat([action_poses[:, :3],
-                                                    action_euler_deg,
-                                                    action_poses[:, 7:8]], dim=-1)  # [Action=7]
+                        __action = torch.concat([__action[:, :3],
+                                                 __action_euler_deg,
+                                                 __action[:, 7:8]], dim=-1)  # [Action=7]
                     else:
-                        action_poses = torch.concat([action_poses[:, :3],
-                                                    action_euler_deg], dim=-1)  # [Action=6]
+                        __action = torch.concat([__action[:, :3],
+                                                 __action_euler_deg], dim=-1)  # [Action=6]
 
                     episode = {
-                        'action': action_poses.cpu().numpy(), # [Action, 6 or 7]
-                        'robot_eef_pose': robot_eef_poses.cpu().numpy()  # [Action, 6 or 7]
+                        'action': __action.cpu().numpy(), # [Action, 6 or 7]
+                        'robot_eef_pose': __robot_eef_pose.cpu().numpy(),  # [Action, 6 or 7]
                     }
+                    if args_cli.gripper:
+                        episode['gripper_position'] = __gripper_position.cpu().numpy()  # [Action, 1]
+
                     replay_buffer.add_episode(episode)
                     episode_cnt += 1
 

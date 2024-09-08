@@ -16,9 +16,10 @@ from omni.isaac.lab.app import AppLauncher
 parser = argparse.ArgumentParser(description="Collect demonstrations for Isaac Lab environments.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default="Isaac-Lift-Cube-Franka-IK-Abs-dp", help="Name of the task.")
-parser.add_argument("--ckpt_path", type=str, default=r"D:\git_project\IsaacLab\logs\robomimic\Isaac-Lift-Cube-Franka-IK-Rel-dp_20240907_6d_frame2\latest_50.ckpt", help="Name of the task.")
+parser.add_argument("--ckpt_path", type=str, default=r"D:\git_project\IsaacLab\logs\robomimic\Isaac-Lift-Cube-Franka-IK-Rel-dp_20240908_7d_frame2\latest.ckpt", help="Name of the task.")
 parser.add_argument("--replicator", type=bool, default=False, help="enable table replicator")
 parser.add_argument("--teleop_device", type=str, default="keyboard", help="Device for interacting with environment")
+parser.add_argument("--gripper", type=bool, default=False, help="collect gripper status, open 1, close -1")
 parser.add_argument("--out_dim", type=int, default=6, help="low-dim or high dim task")
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -268,6 +269,7 @@ def main():
     tv_images_list = []
     eih_images_list = []
     robot_eef_pose_list = []
+    gripper_action_list = []
     # simulate environment -- run everything in inference mode
     with contextlib.suppress(KeyboardInterrupt) and torch.inference_mode():
         while True:
@@ -291,8 +293,10 @@ def main():
             # -- ee pose
             robot_eef_pos = obs_dict["policy"]["robot_eef_pos"]
             robot_eef_quat = obs_dict["policy"]["robot_eef_quat"]
+            gripper_actions = obs_dict["policy"]["gripper_actions"]
             robot_eef_position = torch.concat([robot_eef_pos, robot_eef_quat], dim=-1)
             robot_eef_pose_list.append(robot_eef_position)
+            gripper_action_list.append(gripper_actions)
 
             # predict every two frames [(1, H, W, 3) ... (1, H, W, 3)]
             if len(tv_images_list) == 2:
@@ -306,16 +310,15 @@ def main():
                 camera_3 = camera_3.unsqueeze(0) # [1, 2, C, H, W]
                 # print("camera_3 ", camera_3.shape)
 
+                # convert quat to euler
                 robot_eef_pose = torch.concat(robot_eef_pose_list, dim=0) # [2, 7]
                 robot_eef_pose = convert_quat_to_euler(robot_eef_pose) # [2, 6] quat to euler
-
                 # for XY (low-dim) prediction
                 if args_cli.out_dim == 2:
                     robot_eef_pose = robot_eef_pose[:, :2].unsqueeze(0) # [1, 2, 2]
                 # for XYZRPY (high-dim) prediction
                 if args_cli.out_dim == 6:
                     robot_eef_pose = robot_eef_pose.unsqueeze(0)  # [1, 2, 6]
-
                 # print("robot_eef_pose ", robot_eef_pose.shape)
 
                 obs = {
@@ -323,6 +326,10 @@ def main():
                     "camera_3": camera_3,
                     "robot_eef_pose": robot_eef_pose,
                 }
+                if args_cli.gripper:
+                    gripper_position = torch.concat(gripper_action_list, dim=0)  # [2, 7]
+                    gripper_position = gripper_position.unsqueeze(0)  # [1, 2, 1]
+                    obs['gripper_position'] = gripper_position
 
                 with torch.no_grad():
                     policy.reset()
@@ -330,11 +337,23 @@ def main():
 
                 actions = result['action']  # [1, N=15, XY-Plane=2] N frames
                 # take first frame
-                xy_action = actions[:, 0, :]  # take first frame
+                actions = actions[:, 0, :]  # take first frame
+
+                if args_cli.gripper:
+                    predict_gripper_position = actions[:, -1:]  # gripper predict by policy
+                    print("predict_gripper_position ", predict_gripper_position)
+                    predict_gripper_position = torch.where(predict_gripper_position > 0.8,
+                                                           torch.tensor(1.0),
+                                                           torch.tensor(-1.0))
+                else:
+                    predict_gripper_position = init_actions[:, 7:8] # gripper does not change
 
                 # 因为DP源代码没有XYZ的config, 因此这里手动取前3个action
                 act_dim = 3 # 2 or 3 or 6
-                actions = torch.concat([xy_action[:, :act_dim], init_actions[:, act_dim:]], dim=-1)  # [1, 8] xyz,wxyz,gripper
+                actions = torch.concat([actions[:, :act_dim],  # predict action XYZ or XY
+                                        init_actions[:, act_dim:7],  # init action WXYZ or Z + WXYZ
+                                        predict_gripper_position],
+                                       dim=-1)  # [1, 8] xyz,wxyz,gripper
                 # print("actions ", actions.shape)
 
                 # perform action on environment

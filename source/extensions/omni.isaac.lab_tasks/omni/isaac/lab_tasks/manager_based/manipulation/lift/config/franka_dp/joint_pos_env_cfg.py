@@ -61,6 +61,23 @@ class FrankaCubeLiftEnvCfg(LiftEnvWithCameraCfg):
             ),
         )
 
+        self.scene.bin = RigidObjectCfg(
+            prim_path="{ENV_REGEX_NS}/Bin",
+            init_state=RigidObjectCfg.InitialStateCfg(pos=[0.5, 0.30, 0.08], rot=[0.707, 0, 0, 0.707]),
+            spawn=UsdFileCfg(
+                usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/KLT_Bin/small_KLT.usd",
+                scale=(1.0, 1.0, 0.8),
+                rigid_props=RigidBodyPropertiesCfg(
+                    solver_position_iteration_count=16,
+                    solver_velocity_iteration_count=1,
+                    max_angular_velocity=1000.0,
+                    max_linear_velocity=1000.0,
+                    max_depenetration_velocity=5.0,
+                    disable_gravity=False,
+                ),
+            ),
+        )
+
         # Listens to the required transforms
         marker_cfg = FRAME_MARKER_CFG.copy()
         marker_cfg.markers["frame"].scale = (0.1, 0.1, 0.1)

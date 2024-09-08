@@ -45,6 +45,7 @@ class ObjectTableSceneCfg(InteractiveSceneCfg):
     ee_frame: FrameTransformerCfg = MISSING
     # target object: will be populated by agent env cfg
     object: RigidObjectCfg = MISSING
+    bin: RigidObjectCfg = MISSING
     # camera
     top_view_camera = CameraCfg(
         prim_path="/World/envs/env_.*/Camera",
@@ -79,13 +80,6 @@ class ObjectTableSceneCfg(InteractiveSceneCfg):
         init_state=AssetBaseCfg.InitialStateCfg(pos=[0.5, 0, 0], rot=[0.707, 0, 0, 0.707]),
         spawn=UsdFileCfg(usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Mounts/SeattleLabTable/table_instanceable.usd"),
     )
-
-    # # Bin
-    # bin = AssetBaseCfg(
-    #     prim_path="{ENV_REGEX_NS}/Bin",
-    #     init_state=AssetBaseCfg.InitialStateCfg(pos=[0.5, 0.35, 0.08], rot=[0.707, 0, 0, 0.707]),
-    #     spawn=UsdFileCfg(usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/KLT_Bin/small_KLT.usd"),
-    # )
 
     # plane
     plane = AssetBaseCfg(
@@ -147,6 +141,7 @@ class ObservationsCfg:
         top_view_camera = ObsTerm(func=mdp.top_view_camera)
         eye_in_hand_camera = ObsTerm(func=mdp.eye_in_hand_camera)
         actions = ObsTerm(func=mdp.last_action)
+        gripper_actions = ObsTerm(func=mdp.last_action, params={"action_name": "gripper_action"})
 
         def __post_init__(self):
             self.enable_corruption = True
@@ -166,9 +161,19 @@ class EventCfg:
         func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
-            "pose_range": {"x": (-0.1, 0.1), "y": (-0.25, 0.25), "z": (0.0, 0.0)},
+            "pose_range": {"x": (-0.1, 0.1), "y": (-0.25, 0), "z": (0.0, 0.0)},
             "velocity_range": {},
             "asset_cfg": SceneEntityCfg("object", body_names="Object"),
+        },
+    )
+
+    reset_bin_position = EventTerm(
+        func=mdp.reset_root_state_uniform,
+        mode="reset",
+        params={
+            "pose_range": {"x": (-0.1, 0.1), "y": (-0.1, 0), "z": (0.0, 0.0)},
+            "velocity_range": {},
+            "asset_cfg": SceneEntityCfg("bin", body_names="Bin"),
         },
     )
 
