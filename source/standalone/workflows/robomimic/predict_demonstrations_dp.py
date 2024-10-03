@@ -16,11 +16,9 @@ from omni.isaac.lab.app import AppLauncher
 parser = argparse.ArgumentParser(description="Collect demonstrations for Isaac Lab environments.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default="Isaac-Lift-Cube-Franka-IK-Abs-dp", help="Name of the task.")
-parser.add_argument("--ckpt_path", type=str, default=r"D:\git_project\IsaacLab\logs\robomimic\Isaac-Lift-Cube-Franka-IK-Rel-dp_20240908_7d_frame2\latest.ckpt", help="Name of the task.")
+parser.add_argument("--ckpt_path", type=str, default=r"D:\git_project\IsaacLab\logs\diffusion_policy\traj15\latest.ckpt", help="Name of the task.")
 parser.add_argument("--replicator", type=bool, default=False, help="enable table replicator")
 parser.add_argument("--teleop_device", type=str, default="keyboard", help="Device for interacting with environment")
-parser.add_argument("--gripper", type=bool, default=False, help="collect gripper status, open 1, close -1")
-parser.add_argument("--out_dim", type=int, default=6, help="low-dim or high dim task")
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -38,59 +36,86 @@ import torch
 import hydra
 import dill
 
-from omni.isaac.lab.devices import Se3Keyboard, Se3SpaceMouse
-from omni.isaac.lab.managers import TerminationTermCfg as DoneTerm
+from omni.isaac.lab.devices import Se3Keyboard, Se3SpaceMouse, Se3Keyboard_Dual
+# from omni.isaac.lab.managers import TerminationTermCfg as DoneTerm
 
 import omni.isaac.lab_tasks  # noqa: F401
-from omni.isaac.lab_tasks.manager_based.manipulation.lift import mdp
+# from omni.isaac.lab_tasks.manager_based.manipulation.lift import mdp
 from omni.isaac.lab_tasks.utils.parse_cfg import parse_env_cfg
-from omni.isaac.lab.utils.math import project_points, euler_xyz_from_quat, matrix_from_quat
+from omni.isaac.lab.utils.math import matrix_from_quat, compute_pose_error, subtract_frame_transforms
 
 import omni.replicator.core as rep
 
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
+from diffusion_policy.common.pytorch_util import dict_apply
+from diffusion_policy.real_world.real_inference_util import get_real_obs_dict
+
+from dp_utils import (quat_from_euler_xyz,
+                      euler_xyz_from_quat,
+                      inverse_transformation,
+                      pre_process_actions)
 
 
-def pre_process_actions(delta_pose: torch.Tensor, gripper_command: bool) -> torch.Tensor:
-    """Pre-process actions for the environment."""
-    # compute actions based on environment
-    if "Reach" in args_cli.task:
-        # note: reach is the only one that uses a different action space
-        # compute actions
-        return delta_pose
-    else:
-        # resolve gripper command
-        gripper_vel = torch.zeros((delta_pose.shape[0], 1), dtype=torch.float, device=delta_pose.device)
-        gripper_vel[:] = -1 if gripper_command else 1
-        # compute actions
-        return torch.concat([delta_pose, gripper_vel], dim=1)
+def run_env_until_converge(get_obs_dict_callback, actions,
+                           pos_error_thresh=0.01, axis_angle_error_thresh=0.01, max_attempts=100, verbose=False):
+    """
+    Runs the environment and exits the loop if the position error and axis-angle error are below the thresholds.
 
+    Args:
+        get_obs_dict_callback: Callback function to fetch `obs_dict`. It should return the observation dictionary.
+        actions: Actions, a 2D array where the first dimension is the timestep, and the second dimension includes position and quaternion commands.
+        pos_error_thresh: Position error threshold, below which the loop exits.
+        axis_angle_error_thresh: Axis-angle error threshold, below which the loop exits.
+        max_attempts: Maximum number of attempts (iterations) to try before exiting.
+        verbose: If True, prints debug information during execution.
 
-def inverse_transformation(R, t):
-    """计算位姿矩阵的逆"""
-    R_inv = R.t()  # 旋转矩阵的逆是它的转置
-    t_inv = -torch.matmul(R_inv, t)
-    return R_inv, t_inv
+    Returns:
+        (converged: bool, steps: int):
+            converged: True if the loop exits due to error thresholds being met, False if it exits after max_attempts or due to termination.
+            steps: The number of steps actually executed.
+    """
 
+    for i in range(max_attempts):
+        # 对环境执行动作
+        obs_dict = get_obs_dict_callback(actions)
 
-def get_object_pose_in_camera_frame(R_cam_inv, t_cam_inv, R_obj, t_obj):
-    """计算物体在相机坐标系下的位姿"""
-    # 物体相对于相机 = 相机逆位姿 * 物体位姿
-    R_obj_to_cam = torch.matmul(R_cam_inv, R_obj)
-    t_obj_to_cam = torch.matmul(R_cam_inv, t_obj) + t_cam_inv
+        # 获取机器人末端执行器的位置和四元数
+        next_right_robot_eef_pos = obs_dict["policy"]["right_robot_eef_pose"][:, :3]
+        next_right_robot_eef_quat = obs_dict["policy"]["right_robot_eef_pose"][:, 3:7]
+        next_left_robot_eef_pos = obs_dict["policy"]["left_robot_eef_pose"][:, :3]
+        next_left_robot_eef_quat = obs_dict["policy"]["left_robot_eef_pose"][:, 3:7]
 
-    return R_obj_to_cam, t_obj_to_cam
+        ############ left arm frame to self frame, action manage ik solver needs self frame instead world frame ####
+        next_left_robot_eef_pos, _ = subtract_frame_transforms(obs_dict["policy"]["left_robot_position_w"][:, :3],
+                                                               obs_dict["policy"]["left_robot_position_w"][:, 3:7],
+                                                               next_left_robot_eef_pos)
 
+        # 计算位置误差和轴角误差
+        right_pos_error, right_axis_angle_error = compute_pose_error(next_right_robot_eef_pos,
+                                                                     next_right_robot_eef_quat,
+                                                                     actions[:, :3],
+                                                                     actions[:, 3:7])
+        left_pos_error, left_axis_angle_error = compute_pose_error(next_left_robot_eef_pos,
+                                                                   next_left_robot_eef_quat,
+                                                                   actions[:, 8:11],
+                                                                   actions[:, 11:15])
 
-def convert_quat_to_euler(poses):
-    roll, pitch, yaw = euler_xyz_from_quat(poses[:, 3:])
-    # quat to euler in xyz-format degree unit
-    euler_rad = torch.concat([roll.unsqueeze(1), pitch.unsqueeze(1), yaw.unsqueeze(1)],
-                             dim=-1)  # [Action, 3]
-    euler_deg = torch.rad2deg(euler_rad)  # [Action, 3]
-    poses = torch.concat([poses[:, :3], euler_deg], dim=-1)  # [Action, 6]
-    return poses
+        right_arm_ok = torch.norm(right_pos_error) < pos_error_thresh and torch.norm(right_axis_angle_error) < axis_angle_error_thresh
+        left_arm_ok = torch.norm(left_pos_error) < pos_error_thresh and torch.norm(left_axis_angle_error) < axis_angle_error_thresh
+
+        # 如果误差小于阈值，退出循环
+        if right_arm_ok and left_arm_ok:
+            if verbose:
+                print(f"right arm : {right_arm_ok}")
+                print(f"left arm : {left_arm_ok}")
+                print(f"Converged at step {i}")
+            return obs_dict, True, i
+
+    # 如果达到最大尝试次数后还未退出，返回未收敛
+    if verbose:
+        print(f"Did not converge after {max_attempts} attempts")
+    return obs_dict, False, max_attempts
 
 
 def load_dp(ckpt_path):
@@ -129,58 +154,27 @@ def main():
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
 
     # modify configuration such that the environment runs indefinitely
-    # until goal is reached
-    env_cfg.terminations.time_out = None
     # set the resampling time range to large number to avoid resampling
     env_cfg.commands.object_pose.resampling_time_range = (1.0e9, 1.0e9)
     # we want to have the terms in the observations returned as a dictionary
     # rather than a concatenated tensor
     env_cfg.observations.policy.concatenate_terms = False
 
-    # add termination condition for reaching the goal otherwise the environment won't reset
-    env_cfg.terminations.object_reached_goal = DoneTerm(func=mdp.object_reached_goal)
-
     # create environment
     env = gym.make(args_cli.task, cfg=env_cfg)
+    obs_dict, _ = env.reset()  # reset environment
 
     # create controller
     if args_cli.teleop_device.lower() == "keyboard":
-        teleop_interface = Se3Keyboard(pos_sensitivity=0.04, rot_sensitivity=0.08)
+        teleop_interface = Se3Keyboard(pos_sensitivity=0.004, rot_sensitivity=1)
+    elif  args_cli.teleop_device.lower() == "keyboard_dual_arm":
+        teleop_interface = Se3Keyboard_Dual(pos_sensitivity=0.004, rot_sensitivity=1)
     elif args_cli.teleop_device.lower() == "spacemouse":
         teleop_interface = Se3SpaceMouse(pos_sensitivity=0.05, rot_sensitivity=0.005)
     else:
         raise ValueError(f"Invalid device interface '{args_cli.teleop_device}'. Supported: 'keyboard', 'spacemouse'.")
     # print helper
     print(teleop_interface)
-
-    # specify directory for logging experiments
-    # log_dir = os.path.join("./logs/robomimic", args_cli.task)
-    # dump the configuration into log-directory
-    # dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
-    # dump_pickle(os.path.join(log_dir, "params", "env.pkl"), env_cfg)
-
-    # reset environment
-    obs_dict, _ = env.reset()
-
-    # reset interfaces
-    teleop_interface.reset()
-
-    # define frank default position (xyz,wxyz,gripper)
-    init_actions = torch.tensor([[0.4567, 0.0005, 0.3838, 0.0080, 0.9226, 0.0326, 0.3842, 1]],
-                                  dtype=torch.float,
-                                  device=env.device)
-    init_actions = init_actions.repeat(env.num_envs, 1)
-
-    print("Prepare env, plz dont move")
-    for i in range(50):
-        # T|R, gripper state
-        obs_dict, rewards, terminated, truncated, info = env.step(init_actions)
-    init_robot_eef_pos = obs_dict["policy"]["robot_eef_pos"]
-    init_robot_eef_quat = obs_dict["policy"]["robot_eef_quat"]
-    init_robot_eef_position = torch.concat([init_robot_eef_pos, init_robot_eef_quat], dim=-1)
-    print("You can move now")
-    print("Robot init robot eef pos : ", init_robot_eef_pos)
-    print("Robot init robot eef quat : ", init_robot_eef_quat)
 
     def episode_success():
         global is_success
@@ -194,17 +188,34 @@ def main():
         is_success = False
         save_episode = True
 
+    def get_obs_dict(actions):
+        # Simulate interacting with the environment and getting obs_dict
+        obs_dict, _, _, _, _ = env.step(actions)
+        return obs_dict
+
+    def prepare_environment(init_actions):
+        """
+        Prepares the environment by performing initialization actions for a number of iterations.
+        """
+        obs_dict, _ = env.reset()  # reset environment
+        teleop_interface.reset()  # reset interfaces
+        print("[Info] Prepare env, please don't move .... ")
+        for _ in range(100):
+            obs_dict = get_obs_dict(init_actions)
+        print("[Info] You can move now")
+        return obs_dict
+
     # add teleoperation key for env reset
     teleop_interface.add_callback("L", episode_fail)
     teleop_interface.add_callback("J", episode_success)
 
     # get camera info
-    tv_cam_name = "top_view_camera"
+    re_cam_name = "right_eye_camera"
+    le_camera = "left_eye_camera"
     eih_cam_name = "eye_in_hand_camera"
-    tv_cam = env.scene.sensors[tv_cam_name]
+    tv_cam = env.scene.sensors[re_cam_name]
     image_h, image_w = tv_cam.image_shape
     # eih_cam = env.scene.sensors[eih_cam_name]
-    # print(tv_cam)
     # print(tv_cam.cfg.prim_path)
     # print(tv_cam.render_product_paths)
 
@@ -226,7 +237,6 @@ def main():
 
     ############################ replicator #############################
     if args_cli.replicator:
-        # # get background info
         table_name = "table"
         table = env.scene[table_name]
         table_path = table.prim_paths[0]
@@ -238,145 +248,158 @@ def main():
         rep.randomizer.register(base_table_random, override=True)
         with rep.trigger.on_custom_event(event_name="Randomize!"):
             rep.randomizer.base_table_random()
-
-        # # get plane info
-        # plane_name = "plane"
-        # plane = env.scene[plane_name]
-        # plane_path = plane.prim_paths[0]
-        # def base_plane_colors():
-        #     plane_prim = rep.get.prims(path_pattern=plane_path)
-        #     with plane_prim:
-        #         rep.randomizer.color(colors=rep.distribution.uniform((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)))
-        #     return plane_prim.node
-        # rep.randomizer.register(base_plane_colors, override=True)
-        # # with rep.trigger.on_frame():
-        # with rep.trigger.on_custom_event(event_name="Randomize!"):
-        #     rep.randomizer.base_plane_colors()
     #######################################################################
+
+    def define_arm_init_pose(init_arm_pos, init_arm_rpy):
+        init_pos = torch.tensor([init_arm_pos], dtype=torch.float, device=env.device).repeat(env.num_envs, 1)
+        init_rpy = torch.tensor([init_arm_rpy], dtype=torch.float, device=env.device).repeat(env.num_envs, 1)
+        init_g = torch.tensor([[1]], dtype=torch.float, device=env.device).repeat(env.num_envs, 1)
+        init_quat = quat_from_euler_xyz(init_rpy)
+        init_actions = torch.concat([init_pos, init_quat, init_g], dim=-1)
+        return init_pos, init_rpy, init_g, init_actions
+
+    # define frank default position (xyz,wxyz,g)
+    INIT_RIGHT_ARM_POS = [0.22, 0.16, 0.50]
+    INIT_RIGHT_ARM_RPY = [180, 0, 90]  # [180, 0, 90]
+    init_right_pos, init_right_rpy, init_right_g, init_right_actions = define_arm_init_pose(INIT_RIGHT_ARM_POS, INIT_RIGHT_ARM_RPY)
+
+    # INIT_LEFT_ARM_POS = [0.22, -0.16, 0.50] # in robot left frame
+    INIT_LEFT_ARM_POS = [0.22, 0.46, 0.50] # in world frame which is robot right
+    INIT_LEFT_ARM_RPY = [180, 0, 90]
+    init_left_pos, init_left_rpy, init_left_g, init_left_actions = define_arm_init_pose(INIT_LEFT_ARM_POS, INIT_LEFT_ARM_RPY)
+
+    ############ left arm frame to self frame, action manage ik solver needs self frame instead world frame ############
+    left_robot_position_w = obs_dict["policy"]["left_robot_position_w"]
+    left_robot_pos_in_w, _ = subtract_frame_transforms(left_robot_position_w[:, :3],
+                                                       left_robot_position_w[:, 3:7],
+                                                       init_left_actions[:, :3])
+    init_left_actions[:, :3] = left_robot_pos_in_w
+    ####################################################################################################################
+
+    # right + left action
+    init_actions = torch.concat([init_right_actions, init_left_actions], dim=-1)
+    # init_actions = torch.concat([init_right_actions], dim=-1)
+    print("[Info] Init action : ", init_actions)
+    print("[Info] Init action shape : ", init_actions.shape)
+
+    # init environment
+    obs_dict = prepare_environment(init_actions)
+    right_abs_action_pos = init_right_pos.clone()
+    right_abs_action_rpy = init_right_rpy.clone()
+    left_abs_action_pos = init_left_pos.clone()
+    left_abs_action_rpy = init_left_rpy.clone()
+
 
     ############################ load dp policy #############################
     policy, cfg, device = load_dp(args_cli.ckpt_path)
     print("[Info] Finish load dp model ")
     #########################################################################
 
-    # save mp4 video for diffusion policy training
-    global is_success
-    global save_episode
-    global tv_images_list
-    global eih_images_list
-    is_success = False
-    save_episode = False
-    tv_images_list = []
-    eih_images_list = []
-    robot_eef_pose_list = []
-    gripper_action_list = []
+    global is_success, save_episode
+
+    tv_images_list, eih_images_list, le_images_list = [], [], []
+    is_success, save_episode = False, False
+    robot_eef_list = []
+
     # simulate environment -- run everything in inference mode
     with contextlib.suppress(KeyboardInterrupt) and torch.inference_mode():
         while True:
-            # store signals before stepping
-            # -- obs
-            # -- camera image
-            tv_cam_image = obs_dict["policy"][tv_cam_name]  # [1, H, W, C]
-            eih_cam_image = obs_dict["policy"][eih_cam_name]
+            # get keyboard command
+            delta_pose, gripper_command = teleop_interface.advance()
+            # convert to torch
+            delta_pose = torch.tensor(delta_pose, dtype=torch.float, device=env.device).repeat(env.num_envs, 1)
+            # compute actions based on environment
+            human_actions = pre_process_actions(delta_pose, gripper_command)
 
-            # -- preprocess image, refer to diffusion_policy\real_world\real_inference_util.py (get_real_obs_dict)
-            # Step1: WARNING BGR to RGB (isaac is BGR, training DP in RGB)
-            tv_cam_image = tv_cam_image[..., [2, 1, 0]]
-            eih_cam_image = eih_cam_image[..., [2, 1, 0]]
-            # Step2: Normalize / 255
-            tv_cam_image = tv_cam_image.float() / 255.0
-            eih_cam_image = eih_cam_image.float() / 255.0
+            ################### convert isaac BGR to RGB ###################
+            # tv_cam_image = cv2.cvtColor(tv_cam_image, cv2.COLOR_BGR2RGB)
+            # eih_cam_image = cv2.cvtColor(eih_cam_image, cv2.COLOR_BGR2RGB)
+            # cv2.imshow('save', tv_cam_image)
+            # cv2.waitKey(1)
 
-            tv_images_list.append(tv_cam_image)
-            eih_images_list.append(eih_cam_image)
+            ################################################################
+            # -- obs:
+            tv_image = obs_dict["policy"][re_cam_name]
+            eih_image = obs_dict["policy"][eih_cam_name]
+            le_image = obs_dict["policy"][le_camera]
+            right_robot_eef_pos = obs_dict["policy"]["right_robot_eef_pose"][:, :3]
+            right_robot_eef_quat = obs_dict["policy"]["right_robot_eef_pose"][:, 3:7]
+            right_robot_eef_rpy = euler_xyz_from_quat(right_robot_eef_quat)  # [:, 3] [-180, 180]
+            right_robot_eef_width = obs_dict["policy"]["right_robot_eef_width"]
+            right_robot_eef = torch.concat([right_robot_eef_pos, right_robot_eef_rpy, right_robot_eef_width], dim=-1) # [1, 8 = xyz, quat, g_width]
+            # gripper_actions = obs_dict["policy"]["gripper_actions"] # [-1, 1]
 
-            # -- ee pose
-            robot_eef_pos = obs_dict["policy"]["robot_eef_pos"]
-            robot_eef_quat = obs_dict["policy"]["robot_eef_quat"]
-            gripper_actions = obs_dict["policy"]["gripper_actions"]
-            robot_eef_position = torch.concat([robot_eef_pos, robot_eef_quat], dim=-1)
-            robot_eef_pose_list.append(robot_eef_position)
-            gripper_action_list.append(gripper_actions)
+            tv_images_list.append(tv_image)
+            eih_images_list.append(eih_image)
+            le_images_list.append(le_image)
+            robot_eef_list.append(right_robot_eef)
 
-            # predict every two frames [(1, H, W, 3) ... (1, H, W, 3)]
-            if len(tv_images_list) == 2:
-                camera_1 = torch.concat(eih_images_list, dim=0) # [frame=2, H, W, C]
-                camera_1 = camera_1.permute(0, 3, 1, 2).contiguous() # [2, C, H, W]
-                camera_1 = camera_1.unsqueeze(0) # [1, 2, C, H, W]
-                # print("camera_1 ", camera_1.shape)
-
-                camera_3 = torch.concat(tv_images_list, dim=0) # [2, H, W, C]
-                camera_3 = camera_3.permute(0, 3, 1, 2).contiguous()  # [2, C, H, W]
-                camera_3 = camera_3.unsqueeze(0) # [1, 2, C, H, W]
-                # print("camera_3 ", camera_3.shape)
-
-                # convert quat to euler
-                robot_eef_pose = torch.concat(robot_eef_pose_list, dim=0) # [2, 7]
-                robot_eef_pose = convert_quat_to_euler(robot_eef_pose) # [2, 6] quat to euler
-                # for XY (low-dim) prediction
-                if args_cli.out_dim == 2:
-                    robot_eef_pose = robot_eef_pose[:, :2].unsqueeze(0) # [1, 2, 2]
-                # for XYZRPY (high-dim) prediction
-                if args_cli.out_dim == 6:
-                    robot_eef_pose = robot_eef_pose.unsqueeze(0)  # [1, 2, 6]
-                # print("robot_eef_pose ", robot_eef_pose.shape)
+            if len(tv_images_list) == 2 and len(eih_images_list) == 2 and len(robot_eef_list) == 2:
+                tv_images_arr = torch.concat(tv_images_list, dim=0).cpu().numpy()
+                eih_images_arr = torch.concat(eih_images_list, dim=0).cpu().numpy()
+                robot_eef_arr = torch.concat(robot_eef_list, dim=0).cpu().numpy()
 
                 obs = {
-                    "camera_1": camera_1,
-                    "camera_3": camera_3,
-                    "robot_eef_pose": robot_eef_pose,
+                    "camera_1": eih_images_arr,  # [2, H, W, 3]
+                    "camera_3": tv_images_arr,  # [2, H, W, 3]
+                    "robot_eef_pose": robot_eef_arr[:, :6],  # [2, 6]
+                    'gripper_position': robot_eef_arr[:, 6:7],  # [2, 1]
                 }
-                if args_cli.gripper:
-                    gripper_position = torch.concat(gripper_action_list, dim=0)  # [2, 7]
-                    gripper_position = gripper_position.unsqueeze(0)  # [1, 2, 1]
-                    obs['gripper_position'] = gripper_position
 
                 with torch.no_grad():
                     policy.reset()
-                    result = policy.predict_action(obs)
+                    obs_dict_np = get_real_obs_dict(
+                        env_obs=obs, shape_meta=cfg.task.shape_meta)
+                    obs_dict = dict_apply(obs_dict_np,
+                                          lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
+                    result = policy.predict_action(obs_dict)
+                    # Receding Horizon Control
+                    actions_rhc = result['action']  # [1, N=15, 7] N frames
+                    assert actions_rhc.shape[-1] == 7
+                    # print("actions_ddpm ", actions_ddpm[:, :, :3])
 
-                actions = result['action']  # [1, N=15, XY-Plane=2] N frames
-                # take first frame
-                actions = actions[:, 0, :]  # take first frame
+                    # must clear !
+                    tv_images_list.clear()
+                    eih_images_list.clear()
+                    robot_eef_list.clear()
 
-                if args_cli.gripper:
-                    predict_gripper_position = actions[:, -1:]  # gripper predict by policy
-                    print("predict_gripper_position ", predict_gripper_position)
-                    predict_gripper_position = torch.where(predict_gripper_position > 0.8,
-                                                           torch.tensor(1.0),
-                                                           torch.tensor(-1.0))
-                else:
-                    predict_gripper_position = init_actions[:, 7:8] # gripper does not change
-
-                # 因为DP源代码没有XYZ的config, 因此这里手动取前3个action
-                act_dim = 3 # 2 or 3 or 6
-                actions = torch.concat([actions[:, :act_dim],  # predict action XYZ or XY
-                                        init_actions[:, act_dim:7],  # init action WXYZ or Z + WXYZ
-                                        predict_gripper_position],
-                                       dim=-1)  # [1, 8] xyz,wxyz,gripper
-                # print("actions ", actions.shape)
-
-                # perform action on environment
-                obs_dict, rewards, terminated, truncated, info = env.step(actions)
-
-                tv_images_list.clear()
-                eih_images_list.clear()
-                robot_eef_pose_list.clear()
+                    num_action = 2
+                    for idx in range(num_action):
+                        actions = actions_rhc[:, idx, :]
+                        abs_action_pos = actions[:, :3]
+                        abs_action_rpy = actions[:, 3:6]
+                        action_gripper = actions[:, 6:7]  # gripper predict by policy
+                        action_gripper = torch.where(action_gripper > 0, torch.tensor(1.0), torch.tensor(-1.0))
+                        # action_gripper = human_actions[:, 6:7]  # [1, 1]
+                        right_abs_actions = torch.concat([abs_action_pos,  # XYZ
+                                                          quat_from_euler_xyz(abs_action_rpy),  # WXYZ
+                                                          action_gripper],
+                                                          dim=-1)  # [1, 8] XYZ, WXYZ, gripper
+                        actions = torch.concat([right_abs_actions, init_left_actions], dim=-1)
+                        obs_dict, converged, steps = run_env_until_converge(get_obs_dict,
+                                                                            actions,
+                                                                            pos_error_thresh=0.02,
+                                                                            axis_angle_error_thresh=0.5,
+                                                                            max_attempts=3,
+                                                                            verbose=True)
 
                 # check that simulation is stopped or not
                 if env.unwrapped.sim.is_stopped():
                     break
 
-                # robomimic only cares about policy observations
-                # -- next ee pose
-                # next_robot_eef_position = torch.concat([obs_dict["policy"]["robot_eef_pos"],
-                #                                    obs_dict["policy"]["robot_eef_quat"]], dim=-1)
-
             if save_episode:
-                env.reset()
-                save_episode = False
-                teleop_interface.reset() # reset gripper state
                 rep.utils.send_og_event("Randomize!") # new rep
+
+                # must clear !
+                is_success, save_episode = False, False
+                tv_images_list, eih_images_list, le_images_list = [], [], []
+                robot_eef_list = []
+
+                obs_dict = prepare_environment(init_actions)
+                # right_abs_action_pos = init_right_pos.clone()
+                # right_abs_action_rpy = init_right_rpy.clone()
+                # left_abs_action_pos = init_left_pos.clone()
+                # left_abs_action_rpy = init_left_rpy.clone()
 
     print("exit simulator")
     # close the simulator
@@ -384,7 +407,5 @@ def main():
 
 
 if __name__ == "__main__":
-    # run the main function
     main()
-    # close sim app
     simulation_app.close()
