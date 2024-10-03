@@ -7,3 +7,4 @@
 
 from .se2_keyboard import Se2Keyboard
 from .se3_keyboard import Se3Keyboard
+from .se3_keyboard_dual import Se3Keyboard_Dual
